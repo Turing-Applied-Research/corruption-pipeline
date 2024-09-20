@@ -1,0 +1,323 @@
+import os
+import argparse
+from collections import defaultdict
+from typing import List, Dict
+from pydantic import BaseModel, Field
+
+from src.utils import (
+    query_openai_llm,
+    run_in_parallel_thread,
+    write_to_json_file,
+    read_json_file,
+    create_directory
+)
+from src.tagging import IssueTypes
+
+
+class CorrectnessAspectEvaluation(BaseModel):
+    value: str = Field(
+        description="Indicates if the aspect is satisfactory. Should be 'Yes' or 'No'.",
+    )
+    explanation: str = Field(
+        description="Explanation for the given value, both for 'Yes' or 'No'."
+    )
+
+
+class CorrectnessEvaluation(BaseModel):
+    accuracy: CorrectnessAspectEvaluation = Field(
+        description="Indicates if the response is accurate. Should be 'Yes' or 'No'."
+    )
+    completeness: CorrectnessAspectEvaluation = Field(
+        description="Indicates if the response is complete. Should be 'Yes' or 'No'."
+    )
+    clarity: CorrectnessAspectEvaluation = Field(
+        description="Indicates if the response is clear. Should be 'Yes' or 'No'."
+    )
+    logical_consistency: CorrectnessAspectEvaluation = Field(
+        description="Indicates if the response is logically consistent. Should be 'Yes' or 'No'."
+    )
+
+
+class EmbeddedErrors(BaseModel):
+    error_types: List[str] = Field(
+        description="List the error types that can be found into the assistant's response."
+    )
+    embedded_errors: Dict[str, str] = Field(
+        description="For each identified error type, provide a brief description where it exists and it's justification."
+    )
+
+
+def check_correctness(user_query, model_response, prompt_id):
+    prompt = f"""
+    ## INSTRUCTION
+    You are provided with a conversation where a user requests a solution from an LLM assistant. 
+    The user's query: "{user_query}"
+    The model's response: "{model_response}"
+
+    Please review this response and evaluate it based on the following criteria:
+    1. **Accuracy:** Is the information provided accurate?
+    2. **Completeness:** Does the response address all aspects of the user's query?
+    3. **Clarity:** Is the response clear and easy to understand?
+    4. **Logical Consistency:** Does the response make logical sense given the query?
+
+    If the response is incorrect or incomplete, please provide a detailed explanation and offer a corrected or improved version.
+
+    ## OUTPUT FORMAT:
+    The output should be a JSON object that conforms to the following Pydantic model:
+    
+    ========
+    class CorrectnessEvaluation(BaseModel):
+        accuracy: str = Field(
+            description="Indicates if the response is accurate. Should be 'Yes' or 'No'."
+        )
+        completeness: str = Field(
+            description="Indicates if the response is complete. Should be 'Yes' or 'No'."
+        )
+        clarity: str = Field(
+            description="Indicates if the response is clear. Should be 'Yes' or 'No'."
+        )
+        logical_consistency: str = Field(
+            description="Indicates if the response is logically consistent. Should be 'Yes' or 'No'."
+        )
+    
+    class CorrectnessAspectEvaluation(BaseModel):
+        value: str = Field(
+            description="Indicates if the aspect is satisfactory. Should be 'Yes' or 'No'.",
+        )
+        explanation: str = Field(
+            description="Explanation for the given value, both for 'Yes' or 'No'."
+        )
+    ========
+    
+    ## EXAMPLE OUTPUT:
+    {{
+        "accuracy": {{
+        "value": "Yes",
+        "explanation": "The information provided is accurate. The response correctly explains how to use the rest parameter, the spread operator, and the arguments object to handle functions with any number of parameters in JavaScript."
+        }},
+        "completeness": {{
+        "value": "Yes",
+        "explanation": "The response addresses all aspects of the user's query. It provides multiple methods to modify a JavaScript function to accept any number of parameters, including examples and explanations for each method."
+        }},
+        "clarity": {{
+        "value": "Yes",
+        "explanation": "The response is clear and easy to understand. The examples provided are straightforward, and the explanations are concise and informative."
+        }},
+        "logical_consistency": {{
+        "value": "Yes",
+        "explanation": "The response is logically consistent. It follows a coherent structure, starting with the most modern and recommended approach (rest parameter) and then discussing older methods (spread operator and arguments object)."
+        }},
+
+    }}
+    """
+    out = query_openai_llm(prompt, CorrectnessEvaluation)
+    out.update({"prompt_id": prompt_id})
+    return out
+
+
+def check_for_errors(user_query, model_response, errors_list, prompt_id):
+    prompt = f"""
+    ## INSTRUCTION
+    You are provided with a user query and the response generated by an AI model. Additionally, you are given a list
+    of potential error types that might occur in the response. Your task is to evaluate the response and determine 
+    if it contains any of the specified errors. If an error is present, identify it and explain why it is an error. 
+    If no errors are found, confirm that the response is error-free.
+
+    ### USER QUERY
+    "{user_query}"
+
+    ### MODEL RESPONSE
+    "{model_response}"
+
+    ### POSSIBLE ERRORS
+    {errors_list}
+
+     ## OUTPUT FORMAT INSTRUCTIONS:
+    The output should be a JSON object that conforms to the following Pydantic model:
+
+    ======
+    class EmbeddedErrors(BaseModel):
+        error_types: List[str] = Field(description="List the error types that can be found into the assistant's response.")
+        embedded_errors: Dict[str, str] = Field(description="For each identified error type, provide a brief description where it exists and it's justification.")
+    ======
+    
+    ## EXAMPLE OUTPUT
+    {{
+      "error_types": [
+        "irrelevant-information",
+        "redundant-information",
+        "inconsistent-terminology",
+        "incorrect-explanation"
+      ],
+      "embedded_errors": {{
+        "irrelevant-information": "Include a paragraph about the importance of having a good internet connection for using the web-based job search application, which is not directly related to the design of the application.",
+        "redundant-information": "Repeat the explanation about the search component and its functionality in a different part of the response.",
+        "inconsistent-terminology": "Use different terms interchangeably for the same concept, such as 'job listings' and 'job postings' without clarifying that they mean the same thing.",
+        "incorrect-explanation": "Provide an incorrect explanation about the registration system, such as stating that candidates need to register as employers to apply for jobs."
+      }}
+    }}
+    """
+
+    output = query_openai_llm(prompt, EmbeddedErrors)
+    output.update({"prompt_id": prompt_id})
+    return output
+
+
+def error_and_correctness_stats(error_evaluations, correctness_evaluations, model):
+
+    err_type_stats = defaultdict(int)
+    error_free_count = 0
+
+    for evaluation in error_evaluations:
+        err_types = evaluation.get("error_types", [])
+        if not err_types:
+            error_free_count += 1
+            
+        for err_type in err_types:
+            err_type_stats[err_type.lower()] += 1
+
+    print(
+        f"Error Rate {model}: {(len(error_evaluations) - error_free_count)/len(error_evaluations)}"
+    )
+
+
+    stats = defaultdict(lambda: {"yes": 0, "no": 0})
+    for c_eval in correctness_evaluations:
+
+        for aspect, item in c_eval.items():
+            if not isinstance(item, int):
+                stats[aspect][item["value"].lower()] += 1
+
+    for k, items in stats.items():
+        stats[k] = (items["yes"]) / (items["yes"] + items["no"])
+    return (err_type_stats, stats)
+
+
+def run_correctness_evaluation(file_path, output_file):
+    # Correctness
+
+    model_data = read_json_file(file_path)[:10]
+    args_list = []
+    gpt_results = []
+    for item in model_data:
+        prompt_id = item.get("p_id", "")
+        prompt = item.get("prompt", "")
+        messages = item.get("pipeline_response", "")
+        assistant_response = ""
+
+        for message in messages:
+
+            if message.get("role", "") == "assistant":
+                assistant_response = message.get("content", "")
+
+        args_list.append((prompt, assistant_response, prompt_id))
+
+    gpt_results = run_in_parallel_thread(check_correctness, args_list, 100)
+
+    write_to_json_file(
+        gpt_results,
+        f"stats/{output_file}",
+    )
+
+
+def run_error_evaluation(file_path, output_file):
+
+    # Error Rate
+    model_data = read_json_file(file_path)[:10]
+    args_list = []
+    errors_list = [item.value for item in IssueTypes]
+    gpt_results = []
+
+    for item in model_data:
+        prompt_id = item.get("p_id", "")
+        prompt = item.get("prompt", "")
+        messages = item.get("pipeline_response", "")
+        assistant_response = ""
+
+        for message in messages:
+
+            if message.get("role", "") == "assistant":
+                assistant_response = message.get("content", "")
+
+        args_list.append((prompt, assistant_response, errors_list, prompt_id))
+
+    gpt_results = run_in_parallel_thread(check_for_errors, args_list, 100)
+
+    write_to_json_file(
+        gpt_results,
+        f"stats/{output_file}",
+    )
+
+
+if __name__ == "__main__":
+
+    # Initialize the argument parser
+    parser = argparse.ArgumentParser(description="Process a list of file paths.")
+    
+    # Define an argument that accepts multiple file paths
+    parser.add_argument('-i', '--filepaths', type=str, nargs='+', required=True, help="List of file paths for processing.")
+    
+    # Parse the arguments
+    args = parser.parse_args()
+    
+    # Retrieve the list of file paths
+    files = args.filepaths
+    
+    # create output directory
+    create_directory("stats")
+
+    for file in files:
+        filename = file.split("/")[-1]
+        filename = filename.replace(".json", "")
+
+        run_correctness_evaluation(file.replace(".json", ""), f"{filename}-correctness-evaluation")
+        run_error_evaluation(file.replace(".json", ""), f"{filename}-error-evaluation")
+
+    # Show Stats
+    directory_path = "stats"
+    correctness_dfs = []
+    error_dfs = []
+    seen = set()
+    # Loop through all the files in the directory
+    for filename in os.listdir(directory_path):
+        if filename.endswith(".json"):  # Check if the file is a JSON file
+            model = "-".join(filename.replace(".json", "").split("-")[:-2])
+
+            if not model in seen:
+                seen.add(model)
+                import pandas as pd
+
+                error_rate_data = read_json_file(
+                    f"{directory_path}/{model}-error-evaluation"
+                )
+                correctness_data = read_json_file(
+                    f"{directory_path}/{model}-correctness-evaluation"
+                )
+
+                error_rate_data, correctness_data = error_and_correctness_stats(
+                    error_rate_data, correctness_data, model
+                )
+
+                correctness_df = pd.DataFrame(correctness_data, index=[model])
+                error_rate_df = pd.DataFrame(error_rate_data, index=[model])
+                
+                correctness_dfs.append(correctness_df)
+                error_dfs.append(error_rate_df)
+
+    
+    print("\nCorrectness\n")
+    # Merge the two DataFrames on their indices
+    df_comparison = pd.concat(correctness_dfs, axis=0)
+    # Display the DataFrame
+    print(df_comparison.sort_values(by='accuracy', ascending=False))
+
+
+    print("\nErrors Frequency\n")
+
+    # Concatenate the two DataFrames
+    df_combined = pd.concat(error_dfs, axis=0)
+    df_combined = df_combined.fillna(0)
+    df_combined["Total Errors"] = df_combined.sum(axis=1)
+    # Display the combined DataFrame
+    print(df_combined.sort_values(by='Total Errors', ascending=False))
+    # write_to_json_file(df_combined.to_dict(orient="index"), 'output.json')
