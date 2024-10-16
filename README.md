@@ -64,6 +64,7 @@ To compare the performance and efficiency of DPO and TDPO with different annotat
 3. **Train on Corrupted Data:** The reference model was then trained on this corruption dataset, which introduced errors to simulate a compromised model state.
 4. **Retrain with Correct Data:** After corruption, the model was retrained using correct data. We applied both DPO and TDPO techniques in combination with response-level and granularly annotated datasets.
 5. **Evaluate and Compare Results:** Finally, we evaluated the performance of the model under each combination of technique and annotation strategy to determine which yielded the best efficiency and results.
+
 ### **Datasets Used**
 - **Glaive Python Code QA Dataset**: A Kaggle dataset with over 140,000 examples. A subset of 15,000 examples was used for training and testing.
 
@@ -73,7 +74,7 @@ The repository includes scripts for dataset preparation, particularly generating
 
 ### **1. Clone the Repository**
 ```bash
-git clone <https://github.com/your-repo.git>
+git clone git@github.com:Turing-Applied-Research/corruption-pipeline.git
 ```
 
 ### **2. Prepare the SFT Corruption Dataset**
